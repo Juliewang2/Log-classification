@@ -1,0 +1,55 @@
+training部分
+
+
+第一步是DBSCAN聚类，用来把log messages 分成很多cluster并按照包含数目从多到少的顺序把cluster排序（因为一开始并不知道应该写什么Regex。Regex属于人工总结出来的规则，而DBSCAN可以先自动发现日志里面存在的模式。简单说：先聚类发现规律，再根据规律写Regex，而不是反过来靠人猜规律。DBSCAN在这里的作用不是分类，而是帮助发现高频日志模式。），具体是先用sentence transformer把所有日志映射到向量空间然后再用DBSCAN来计算向量之间的相似度最后进行分类。
+
+第二步是提取出来包含日志最多的前几个cluster,
+
+第三步是用Regex提取出来这些聚类里面的关键信息。
+
+第四步作者把包含数目小于等于5行的cluster提取出来，并剔除出去，因为样本太少模型学不会（这里严格来说不是“不管了”，而是“不拿去训练机器学习模型”。因为只有2~5条样本根本不足以让模型学到规律，如果硬训练反而会降低整体准确率。这些少样本类别未来在线上运行时，通常会落入低置信度情况，然后被送给LLM处理。所以作者实际上是在做：“高频类别给ML训练，低频类别交给LLM”，而不是丢弃这些问题。）
+
+最后用Sentence Transformer（这里和第一步使用Sentence Transformer的目的不同。第一步需要计算日志之间的语义相似度用于聚类；这里需要把日志转换成机器学习可使用的特征向量用于分类训练。至于为什么不用TF-IDF，是因为TF-IDF本质上是基于词频统计的Bag-of-Words表示，只看词是否出现，不理解语义。例如“database timeout”和“connection timeout”语义非常接近，但TF-IDF会认为database和connection是不同单词，因此距离可能很远。而Sentence Transformer会把语义相近的句子映射到相近的向量空间，因此效果通常更好。）把Regex提取出来的关键信息（以句为单位）都映射到向量空间，
+
+第六步用Logistic Regression（这里要特别注意，DBSCAN和Logistic Regression根本不是同一种东西。DBSCAN属于无监督学习(Unsupervised Learning)，它只能告诉你“这些日志长得像”，但不知道它们叫什么类别；例如它能给出Cluster1、Cluster2、Cluster3，但不知道哪个是Workflow Error、哪个是Timeout Error。需要人工观察聚类结果并打标签后，才得到真正的训练数据。随后Logistic Regression属于监督学习(Supervised Learning)，它学习“日志向量 → 类别标签”的映射关系。部署上线以后不会再运行DBSCAN，只运行Logistic Regression。DBSCAN用于构建训练集，Logistic Regression才是真正线上使用的分类器。）再做一遍呢？用于训练吗？（是的，真正训练的是Logistic Regression。）咱们的模型是all-MiniLM-L6-v2吗（不完全是。all-MiniLM-L6-v2负责生成Embedding向量，相当于特征提取器；Logistic Regression负责根据Embedding做分类。因此最终系统实际上是“all-MiniLM-L6-v2 + Logistic Regression”的组合，而不是单独的MiniLM。）
+
+如果训练完之后置信度小于0.5那么直接把这些log交给大模型（我的疑问是相当于视频里面的csv只是用于训练，真正的需要programmer产生log，首先放到机器学习的model里面分析，如果置信度小于0.5给llm分析，那我不是还得把这个csv给llm吗，不还是得训练llm分类吗？？？？？（这里其实不需要。CSV只用于训练Logistic Regression，不需要用于训练LLM。LLM本身已经是预训练好的。例如线上出现一条全新的日志：“Dependency package reached end of support”。LR没见过这种日志，于是置信度可能只有0.3，就交给LLM。LLM直接根据自己的语言理解能力和Prompt推理出它属于“Deprecation Warning”。整个过程只把“当前这条日志”发给LLM，而不是把训练CSV发给LLM重新训练。因此这个系统实际上是：Regex处理最简单的问题 → Logistic Regression处理常见问题 → LLM处理长尾和未知问题。LLM在这里承担的是推理器而不是训练后的分类模型。））
+
+
+Programmer产生Log
+        │
+        ▼
+Regex
+        │
+    命中？
+     /   \
+   是     否
+   ↓      ↓
+结束    MiniLM
+          │
+          ▼
+  Logistic Regression
+          │
+    confidence>0.5？
+       /      \
+      是       否
+      ↓        ↓
+   返回类别    LLM
+                │
+                ▼
+            返回类别
+``
+为什么不直接用llm:首先日志格式如果非常固定，使用llm会非常的慢而且很昂贵，其次如果日志包含大量历史样本使用bert embedding和logistic regression可以降低训练成本增加推理速度，只有在样本极少的情况下llm的few shot能力更强。
+Regex 规则怎么发现
+由于日志数量达到数百万级不可能人工阅读所有日志所以使用sentence transformer生成embedding然后使用DBSCAN Clustering将日志聚类，然后人工将每个聚类的特点提取出来，自然就可以使用Regex啦
+processor_bert的设计
+为什么不直接fine-tune bert?
+项目采用Sentence transformer 生成embedding再使用logistic regression进行分类这使得训练更快数据需求小推理成本低。
+processor_llm的设计
+对于样本不足的类别采用prompt classification,给出类别名称并强调unknown就写成unclassified
+为什么采取这个架构
+80%以上的日志直接Regex处理
+成本约等于0
+其次Regex和BERT+LR都是毫秒级别的而LLM是最慢的，最后我把分类器封装成FastAPI微服务器，对外提供http接口
+
+我设计了一个混合日志分类系统。对于规则明确的日志使用Regex处理，对于有大量历史标注数据的日志使用Sentence Transformer生成Embedding，再通过Logistic Regression完成分类；对于样本稀缺的类别使用LLM进行Few-Shot分类。系统通过DBSCAN聚类辅助发现Regex规则，并最终以FastAPI微服务形式部署。这种Hybrid Architecture在准确率、成本和响应速度之间取得了较好的平衡
